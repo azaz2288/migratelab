@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 
-from migratelab.core import MigrationError, preview, statements
+from migratelab.core import MigrationError, load_checks, preview, statements
 
 
 class RehearsalTests(unittest.TestCase):
@@ -46,6 +46,77 @@ class RehearsalTests(unittest.TestCase):
         report = self.run_preview("DELETE FROM players;", preserve_tables=["players"])
         self.assertFalse(report["passed"])
         self.assertEqual(report["after"]["rows"], {"players": 1})
+
+    def test_preserve_data_rejects_equal_row_count_value_change(self):
+        report = self.run_preview("UPDATE players SET name='erased';", preserve_data_tables=["players"])
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["rolled_back"])
+        with closing(sqlite3.connect(self.root / "preview/preview.sqlite")) as connection:
+            self.assertEqual(connection.execute("SELECT name FROM players").fetchone()[0], "mage")
+        self.check_original()
+
+    def test_preserve_data_rejects_column_layout_change(self):
+        report = self.run_preview("ALTER TABLE players ADD COLUMN level INTEGER;", preserve_data_tables=["players"])
+        self.assertFalse(report["passed"])
+
+    def test_preserved_typed_blob_and_values_are_deterministic(self):
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript("CREATE TABLE typed(value); INSERT INTO typed VALUES(1),(1.0),('1'),(NULL),(X'0102');")
+            connection.commit()
+        report = self.run_preview("CREATE TABLE new_table(x);", preserve_data_tables=["typed"])
+        self.assertTrue(report["passed"])
+        self.assertEqual(len(report["preserved_data_sha256"]["typed"]), 64)
+
+    def test_preserve_digest_is_stable_across_nocase_and_numeric_tie_reordering(self):
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript("CREATE TABLE mixed(value COLLATE NOCASE); INSERT INTO mixed VALUES('a'),('A'),(1),(1.0);")
+            connection.commit()
+        sql = "CREATE TABLE staging(value); INSERT INTO staging SELECT value FROM mixed ORDER BY rowid DESC; DELETE FROM mixed; INSERT INTO mixed SELECT value FROM staging; DROP TABLE staging;"
+        report = self.run_preview(sql, preserve_data_tables=["mixed"])
+        self.assertTrue(report["passed"], report)
+
+    def test_scalar_invariant_accepts_required_upgrade_state(self):
+        report = self.run_preview("ALTER TABLE players ADD COLUMN level INTEGER DEFAULT 1;",
+                                  checks=[{"sql": "SELECT count(*) FROM players WHERE level=1", "expected": 1}])
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["checks"][0]["passed"])
+
+    def test_failed_scalar_invariant_rolls_back(self):
+        report = self.run_preview("UPDATE players SET name='wrong';",
+                                  checks=[{"sql": "SELECT name FROM players", "expected": "mage"}])
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["rolled_back"])
+
+    def test_checks_are_read_only_and_reject_multicolumn_results(self):
+        for number, query in enumerate(("DELETE FROM players RETURNING id", "SELECT 1,2", "SELECT id FROM players WHERE 0")):
+            with self.subTest(query=query):
+                report = preview(self.source, self.root / f"check-{number}", "SELECT 1;", checks=[{"sql": query, "expected": 1}])
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["after"]["rows"]["players"], 1)
+
+    def test_malformed_checks_rejected_before_output(self):
+        for candidate in ("wrong", [{}], [{"sql": "SELECT 1;SELECT 2;", "expected": 1}],
+                          [{"sql": "SELECT 1;", "expected": True}], [{"sql": "SELECT 1;", "expected": float("nan")}]):
+            with self.subTest(candidate=candidate), self.assertRaises(MigrationError):
+                self.run_preview("SELECT 1;", checks=candidate)
+            self.assertFalse((self.root / "preview").exists())
+
+    def test_checks_json_rejects_duplicates_nonfinite_and_large_inputs(self):
+        path = self.root / "checks.json"
+        for content in ('[{"sql":"SELECT 1","expected":1,"expected":2}]', '[{"sql":"SELECT 1","expected":NaN}]', "x" * (256 * 1024 + 1)):
+            path.write_text(content)
+            with self.assertRaises(MigrationError):
+                load_checks(path)
+
+    def test_cli_declared_check_and_preserve_data(self):
+        path = self.root / "checks.json"
+        path.write_text(json.dumps([{"sql":"SELECT count(*) FROM players","expected":1}]))
+        sql = self.root / "sql.txt"
+        sql.write_text("CREATE TABLE metadata(x);")
+        result = subprocess.run([sys.executable, "-m", "migratelab", str(self.source), str(sql), str(self.root / "cli"),
+                                 "--checks", str(path), "--preserve-data-table", "players"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(json.loads((self.root / "cli/report.json").read_text())["checks"][0]["passed"])
 
     def test_unknown_preserve_table_is_setup_error(self):
         with self.assertRaises(MigrationError):

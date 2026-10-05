@@ -25,12 +25,24 @@ migratelab source.sqlite migration.sql new-preview
 
 **仅对你信任的SQL和数据库使用**，不是安全沙箱：SQLite/OS资源耗尽、原生漏洞、不执行VM进度回调的操作并无硬截止保障。大小/CPU/磁盘限额需OS隔离。只读打开WAL数据库可能需要访问/创建SQLite sidecar，原库的逻辑数据不迁移，不能把主文件字节hash当WAL逻辑快照的完整摘要。
 
-行数不变不证明数据值不变；schema和错误文本可能包含敏感字段名/字面量，副本更包含全部原数据，因此目录与报告默认应私有。当前没有加密、版本迁移历史或任意用户自定义数据不变量。源库并发更新时backup给出一致SQLite快照，而不是“预览等于未来正式执行”。不自动执行正式迁移。
+行数不变不证明数据值不变；schema和错误文本可能包含敏感字段名/字面量，副本更包含全部原数据，因此目录与报告默认应私有。当前没有加密或版本迁移历史。源库并发更新时backup给出一致SQLite快照，而不是“预览等于未来正式执行”。不自动执行正式迁移。
+
+## v0.2 数据不变量
+
+`--preserve-data-table players` 要求表的列名/顺序与所有typed行值保持不变，检测行数相同但数据被改写，失败时回滚。SQLite分类型、binary collation排序后流式计算摘要，区别NULL/整数/实数/文本/BLOB，不依赖rowid和插入顺序；新增列也会失败。表越大验证成本越高，不包含rowid、index、trigger或访问权限等所有语义。
+
+`--checks checks.json` 可声明最多100个只读scalar SQL验收，例如：
+
+```json
+[{"sql":"SELECT count(*) FROM players WHERE level < 1", "expected":0}]
+```
+
+每个query必须返回恰好一行一列且类型和值都匹配；bool期望拒绝，以免与SQLite整数混淆。authorizer只允许read/SELECT及受控函数，不能把DELETE RETURNING伪装成验收检查。checks只在副本迁移后、commit前执行，任何失败回滚整个迁移。检查SQL仍须可信，复杂query没有OS硬资源隔离。
 
 ## 后续验收
 
 1. 版本迁移图、schema版本与跳级/重复迁移策略。
-2. 可声明列/值/关系不变量，明确避免只看行数。
+2. 在现有typed数据摘要和只读scalar checks基础上扩展声明式关系不变量与版本兼容管理。
 3. 锁竞争、磁盘空间故障、备份中断的故障注入测试。
 4. 大型WAL数据库性能和硬资源隔离选项。
 5. 报告隐私控制、GUI审阅与签名版本发布。

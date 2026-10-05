@@ -14,6 +14,30 @@ class MigrationError(Exception):
     """Invalid input or an incomplete rehearsal."""
 
 
+def _unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise MigrationError("Checks JSON contains duplicate keys")
+        value[key] = item
+    return value
+
+
+def _invalid_constant(value):
+    raise MigrationError("Checks JSON contains nonfinite literals")
+
+
+def load_checks(path: Path):
+    try:
+        with path.open("rb") as stream:
+            content = stream.read(256 * 1024 + 1)
+        if len(content) > 256 * 1024:
+            raise MigrationError("Checks file exceeds 256 KiB limit")
+        return json.loads(content.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise MigrationError("Invalid checks JSON") from exc
+
+
 def statements(sql: str) -> list[str]:
     """Use SQLite's own completeness parser, including triggers and quoted ';'."""
     if not isinstance(sql, str) or len(sql.encode("utf-8")) > 256 * 1024 or "\x00" in sql:
@@ -50,6 +74,45 @@ def _snapshot(connection):
     return {"schema": objects, "rows": counts}
 
 
+def _data_digest(connection, table):
+    """Hash a deterministic multiset of typed row values without retaining rows.
+
+    SQLite orders every selected column. Equal rows serialize identically, so
+    insertion order and rowid changes don't matter. Column layout is included.
+    """
+    cursor = connection.execute(f"SELECT * FROM {_quote(table)} LIMIT 0")
+    columns = [item[0] for item in cursor.description]
+    hasher = hashlib.sha256(json.dumps(columns, ensure_ascii=True).encode())
+    # Explicit type and binary collation prevent equal numeric values or NOCASE
+    # text ties from falling back to insertion order with different encodings.
+    order = ",".join(f"typeof({_quote(name)}),{_quote(name)} COLLATE BINARY" for name in columns)
+    for row in connection.execute(f"SELECT * FROM {_quote(table)} ORDER BY {order}"):
+        values = []
+        for value in row:
+            if value is None:
+                values.append(["null", None])
+            elif isinstance(value, bytes):
+                values.append(["blob", value.hex()])
+            elif type(value) is float:
+                values.append(["real", value.hex()])
+            elif type(value) is int:
+                values.append(["integer", str(value)])
+            else:
+                values.append(["text", value])
+        encoded = json.dumps(values, ensure_ascii=True, separators=(",", ":")).encode()
+        hasher.update(len(encoded).to_bytes(8, "big"))
+        hasher.update(encoded)
+    return hasher.hexdigest()
+
+
+def _read_only_authorizer(action, first, second, database, trigger):
+    if action in {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_RECURSIVE}:
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_FUNCTION and str(second).lower() not in {"load_extension", "writefile", "readfile"}:
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
 def _authorizer(action, first, second, database, trigger):
     forbidden = {sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH,
                  sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT,
@@ -61,7 +124,7 @@ def _authorizer(action, first, second, database, trigger):
     return sqlite3.SQLITE_OK
 
 
-def preview(source: Path, output: Path, sql: str, *, preserve_tables=(), timeout=10.0) -> dict:
+def preview(source: Path, output: Path, sql: str, *, preserve_tables=(), preserve_data_tables=(), checks=(), timeout=10.0) -> dict:
     """Backup a read-only source and migrate ONLY the new isolated copy.
 
     Existing outputs are never replaced. Failed migrations leave a rolled-back
@@ -72,8 +135,16 @@ def preview(source: Path, output: Path, sql: str, *, preserve_tables=(), timeout
         raise MigrationError("Timeout must be finite and in (0, 300] seconds")
     if source.is_symlink() or not source.is_file():
         raise MigrationError("Source must be an existing regular SQLite database")
-    if any(not isinstance(name, str) or not name for name in preserve_tables):
+    if any(not isinstance(name, str) or not name for name in (*preserve_tables, *preserve_data_tables)):
         raise MigrationError("Preserved table names must be nonempty strings")
+    if not isinstance(checks, (list, tuple)) or len(checks) > 100:
+        raise MigrationError("At most 100 scalar checks are allowed")
+    for check in checks:
+        if not isinstance(check, dict) or set(check) != {"sql", "expected"} or len(statements(check["sql"])) != 1:
+            raise MigrationError("Each check needs one SQL statement and expected scalar")
+        expected = check["expected"]
+        if type(expected) not in (str, int, float, type(None)) or (type(expected) is float and not math.isfinite(expected)):
+            raise MigrationError("Check expected value must be a finite JSON scalar (not boolean)")
     commands = statements(sql)
     deadline = time.monotonic() + timeout
 
@@ -96,13 +167,14 @@ def preview(source: Path, output: Path, sql: str, *, preserve_tables=(), timeout
             copy.execute("PRAGMA trusted_schema=OFF")
             copy.set_progress_handler(lambda: int(expired()), 1000)
             before = _snapshot(copy)
-            if set(preserve_tables) - set(before["rows"]):
+            if set((*preserve_tables, *preserve_data_tables)) - set(before["rows"]):
                 raise MigrationError("Preserve policy refers to an unknown table")
+            preserved = {name: _data_digest(copy, name) for name in preserve_data_tables}
             if copy.execute("PRAGMA integrity_check").fetchall() != [("ok",)] or copy.execute("PRAGMA foreign_key_check").fetchone():
                 raise MigrationError("Source snapshot fails integrity or foreign-key checks")
             report = {"version": 1, "passed": False, "rolled_back": False,
                       "migration_sha256": hashlib.sha256(sql.encode()).hexdigest(),
-                      "statements": len(commands), "before": before}
+                      "statements": len(commands), "before": before, "preserved_data_sha256": preserved}
             copy.execute("BEGIN IMMEDIATE")
             attempted = before
             try:
@@ -118,6 +190,20 @@ def preview(source: Path, output: Path, sql: str, *, preserve_tables=(), timeout
                 attempted = _snapshot(copy)
                 if any(attempted["rows"].get(name) != before["rows"][name] for name in preserve_tables):
                     raise MigrationError("Preserved table row count changed or table removed")
+                if any(name not in attempted["rows"] or _data_digest(copy, name) != digest for name, digest in preserved.items()):
+                    raise MigrationError("Preserved table column layout or typed data changed")
+                report["checks"] = []
+                copy.set_authorizer(_read_only_authorizer)
+                for check in checks:
+                    values = copy.execute(check["sql"]).fetchmany(2)
+                    if len(values) != 1 or len(values[0]) != 1:
+                        raise MigrationError("Invariant query must return exactly one row and one column")
+                    actual = values[0][0]
+                    passed = type(actual) is type(check["expected"]) and actual == check["expected"]
+                    report["checks"].append({"sql_sha256": hashlib.sha256(check["sql"].encode()).hexdigest(), "passed": passed})
+                    if not passed:
+                        raise MigrationError("A declared scalar data invariant failed")
+                copy.set_authorizer(None)
                 copy.execute("COMMIT")
                 report["passed"] = True
             except (sqlite3.Error, MigrationError) as exc:
