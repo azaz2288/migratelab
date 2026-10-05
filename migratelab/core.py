@@ -18,24 +18,33 @@ def _unique_object(pairs):
     value = {}
     for key, item in pairs:
         if key in value:
-            raise MigrationError("Checks JSON contains duplicate keys")
+            raise MigrationError("JSON contains duplicate keys")
         value[key] = item
     return value
 
 
 def _invalid_constant(value):
-    raise MigrationError("Checks JSON contains nonfinite literals")
+    raise MigrationError("JSON contains nonfinite literals")
 
 
 def load_checks(path: Path):
+    return _load_json(path)
+
+
+def load_migrations(path: Path):
+    """Read bounded JSON; preview_chain validates the declared edges."""
+    return _load_json(path)
+
+
+def _load_json(path: Path):
     try:
         with path.open("rb") as stream:
             content = stream.read(256 * 1024 + 1)
         if len(content) > 256 * 1024:
-            raise MigrationError("Checks file exceeds 256 KiB limit")
+            raise MigrationError("JSON file exceeds 256 KiB limit")
         return json.loads(content.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
     except (ValueError, UnicodeError, RecursionError) as exc:
-        raise MigrationError("Invalid checks JSON") from exc
+        raise MigrationError("Invalid JSON") from exc
 
 
 def statements(sql: str) -> list[str]:
@@ -71,7 +80,8 @@ def _snapshot(connection):
     tables = [name for (name,) in connection.execute(
         "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
     counts = {name: connection.execute(f"SELECT count(*) FROM {_quote(name)}").fetchone()[0] for name in tables}
-    return {"schema": objects, "rows": counts}
+    return {"schema": objects, "rows": counts,
+            "user_version": connection.execute("PRAGMA user_version").fetchone()[0]}
 
 
 def _data_digest(connection, table):
@@ -124,7 +134,46 @@ def _authorizer(action, first, second, database, trigger):
     return sqlite3.SQLITE_OK
 
 
-def preview(source: Path, output: Path, sql: str, *, preserve_tables=(), preserve_data_tables=(), checks=(), timeout=10.0) -> dict:
+def _validate_chain(migrations):
+    if not isinstance(migrations, (list, tuple)) or not 1 <= len(migrations) <= 100:
+        raise MigrationError("A chain must contain 1 to 100 declared migrations")
+    steps, previous, total_bytes = [], None, 0
+    for migration in migrations:
+        if not isinstance(migration, dict) or set(migration) != {"from_version", "to_version", "sql"}:
+            raise MigrationError("Each migration needs exactly from_version, to_version and sql")
+        start, end, sql = (migration[key] for key in ("from_version", "to_version", "sql"))
+        if any(type(value) is not int or not 0 <= value <= 2147483647 for value in (start, end)) or start >= end:
+            raise MigrationError("Versions must be increasing integers in [0, 2147483647]")
+        if previous is not None and start != previous:
+            raise MigrationError("Migration chain has a gap, branch or repeated edge")
+        commands = statements(sql)
+        total_bytes += len(sql.encode('utf-8'))
+        if total_bytes > 256 * 1024:
+            raise MigrationError("Combined migration SQL exceeds 256 KiB limit")
+        steps.append({"from_version": start, "to_version": end, "sql": sql, "commands": commands})
+        previous = end
+    return steps
+
+
+def preview(source: Path, output: Path, sql: str, *, preserve_tables=(), preserve_data_tables=(), checks=(), timeout=10.0,
+            from_version=None, to_version=None) -> dict:
+    """Rehearse SQL, optionally requiring an explicit schema-version edge."""
+    if from_version is not None or to_version is not None:
+        steps = _validate_chain([{"from_version": from_version, "to_version": to_version, "sql": sql}])
+    else:
+        steps = [{"sql": sql, "commands": statements(sql)}]
+    return _preview(source, output, steps, preserve_tables=preserve_tables,
+                    preserve_data_tables=preserve_data_tables, checks=checks, timeout=timeout)
+
+
+def preview_chain(source: Path, output: Path, migrations, *, preserve_tables=(), preserve_data_tables=(), checks=(), timeout=10.0) -> dict:
+    """Rehearse a contiguous declared upgrade chain as one atomic transaction."""
+    steps = _validate_chain(migrations)
+    return _preview(source, output, steps, preserve_tables=preserve_tables,
+                    preserve_data_tables=preserve_data_tables, checks=checks, timeout=timeout)
+
+
+def _preview(source, output, steps, *, preserve_tables, preserve_data_tables, checks, timeout):
     """Backup a read-only source and migrate ONLY the new isolated copy.
 
     Existing outputs are never replaced. Failed migrations leave a rolled-back
@@ -145,7 +194,12 @@ def preview(source: Path, output: Path, sql: str, *, preserve_tables=(), preserv
         expected = check["expected"]
         if type(expected) not in (str, int, float, type(None)) or (type(expected) is float and not math.isfinite(expected)):
             raise MigrationError("Check expected value must be a finite JSON scalar (not boolean)")
-    commands = statements(sql)
+    versioned = 'from_version' in steps[0]
+    # Single-SQL hashes retain their original meaning. Multi-step chains have
+    # explicit boundaries so different step partitions cannot share a digest.
+    migration_bytes = steps[0]['sql'].encode() if len(steps) == 1 else json.dumps(
+        [{key: step[key] for key in ('from_version', 'to_version', 'sql')} for step in steps],
+        ensure_ascii=True, separators=(',', ':')).encode()
     deadline = time.monotonic() + timeout
 
     def expired():
@@ -173,15 +227,30 @@ def preview(source: Path, output: Path, sql: str, *, preserve_tables=(), preserv
             if copy.execute("PRAGMA integrity_check").fetchall() != [("ok",)] or copy.execute("PRAGMA foreign_key_check").fetchone():
                 raise MigrationError("Source snapshot fails integrity or foreign-key checks")
             report = {"version": 1, "passed": False, "rolled_back": False,
-                      "migration_sha256": hashlib.sha256(sql.encode()).hexdigest(),
-                      "statements": len(commands), "before": before, "preserved_data_sha256": preserved}
+                      "migration_sha256": hashlib.sha256(migration_bytes).hexdigest(),
+                      "statements": sum(len(step['commands']) for step in steps), "executed": 0,
+                      "before": before, "preserved_data_sha256": preserved}
+            if versioned:
+                report['migration_chain'] = [{"from_version": step['from_version'], "to_version": step['to_version'],
+                                             "sql_sha256": hashlib.sha256(step['sql'].encode()).hexdigest(),
+                                             "executed": 0} for step in steps]
             copy.execute("BEGIN IMMEDIATE")
             attempted = before
             try:
-                copy.set_authorizer(_authorizer)
-                for index, command in enumerate(commands, 1):
-                    copy.execute(command)
-                    report["executed"] = index
+                if versioned and before['user_version'] != steps[0]['from_version']:
+                    raise MigrationError("Source snapshot user_version does not match the declared starting version")
+                for step_index, step in enumerate(steps):
+                    copy.set_authorizer(_authorizer)
+                    for command in step['commands']:
+                        copy.execute(command)
+                        report['executed'] += 1
+                        if versioned:
+                            report['migration_chain'][step_index]['executed'] += 1
+                    copy.set_authorizer(None)
+                    if versioned:
+                        # Values are validated integers; only controlled code may
+                        # write this PRAGMA, inside the same rollback transaction.
+                        copy.execute(f"PRAGMA user_version={step['to_version']}")
                 copy.set_authorizer(None)
                 if copy.execute("PRAGMA foreign_key_check").fetchone():
                     raise MigrationError("Migration breaks foreign-key integrity")

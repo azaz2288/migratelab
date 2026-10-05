@@ -39,9 +39,37 @@ migratelab source.sqlite migration.sql new-preview
 
 每个query必须返回恰好一行一列且类型和值都匹配；bool期望拒绝，以免与SQLite整数混淆。authorizer只允许read/SELECT及受控函数，不能把DELETE RETURNING伪装成验收检查。checks只在副本迁移后、commit前执行，任何失败回滚整个迁移。检查SQL仍须可信，复杂query没有OS硬资源隔离。
 
-## 后续验收
+## v0.3 受控版本与迁移链
 
-1. 版本迁移图、schema版本与跳级/重复迁移策略。
+单次SQL可声明版本边：
+
+```sh
+migratelab source.sqlite migration.sql new-preview --from-version 2 --to-version 3
+```
+
+以backup完成后的副本 `PRAGMA user_version` 为准。起点不匹配时SQL一条也不执行，报告拒绝并回滚；目标版本由工具在同一事务内设置，用户SQL仍不能执行PRAGMA。既有无版本参数的SQL模式不变，报告增加迁移前后 `user_version`，不隐式改版本。
+
+批量升级把 `migration` 输入切换成JSON（不自动读取任何工程内策略）：
+
+```json
+[
+  {"from_version": 2, "to_version": 3, "sql": "ALTER TABLE players ADD COLUMN level INTEGER DEFAULT 1;"},
+  {"from_version": 3, "to_version": 5, "sql": "UPDATE players SET level=2;"}
+]
+```
+
+```sh
+migratelab source.sqlite chain.json new-preview --chain --preserve-table players
+python examples/version_chain.py
+```
+
+Python API为 `preview_chain(source, output, migrations, ...)`，支持原有保留表/typed数据/只读checks/timeout选项。链要求1至100条，版本必须是0至2147483647的严格整数（bool拒绝），每条递增、相邻边起终点衔接，SQL总量与JSON文件均限256KiB。允许明确声明3到5的边；不猜跳级路径、不排序或自动选择分支。重复边、降级、断链、不完整版本参数在创建输出前拒绝。
+
+整条链是**一个事务**；中途SQL或最终不变量失败，先前结构、数据和版本一起回滚。`migration_chain` 报告每条边、SQL摘要和成功执行的语句数（不等于已提交）；`after.user_version` 是实际提交/回滚后的版本。多步顶层摘要是规范JSON链的SHA256，单步仍为原始SQL SHA256。版本只是应用自报整数，不证明对应schema正确；请同时使用不变量。当前不是版本图自动寻路，也不是正式库的持久迁移历史账本。
+
+## 后续验收路线
+
+1. 在已实现显式版本链基础上增加迁移图审阅和受控版本历史，不能自动猜正式迁移路径。
 2. 在现有typed数据摘要和只读scalar checks基础上扩展声明式关系不变量与版本兼容管理。
 3. 锁竞争、磁盘空间故障、备份中断的故障注入测试。
 4. 大型WAL数据库性能和硬资源隔离选项。
