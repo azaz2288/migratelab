@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "migratelab"
+version = "0.1.0"
+description = "Read-only SQLite backup and isolated transactional migration rehearsal"
+requires-python = ">=3.12"
+readme = "README.md"
+license = "MIT"
+authors = [{name = "azaz2288"}]
+dependencies = []
+[project.scripts]
+migratelab = "migratelab.__main__:main"
+[tool.setuptools.packages.find]
+include = ["migratelab*"]
