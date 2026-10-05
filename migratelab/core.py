@@ -4,14 +4,40 @@ from contextlib import closing
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sqlite3
+import tempfile
 import time
 
 
 class MigrationError(Exception):
     """Invalid input or an incomplete rehearsal."""
+
+
+def _publish_report(output: Path, report: dict):
+    """Publish complete, fsynced bytes without replacing another writer.
+
+    The temporary name is private to this invocation. Hardlink support is
+    required: unsupported filesystems fail closed instead of using replace.
+    This is not a directory-fsync or machine-power-loss durability guarantee.
+    """
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                         prefix=".report-", suffix=".tmp",
+                                         dir=output, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(report, stream, ensure_ascii=True, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Unlike replace/rename, link fails if the final name already exists.
+        os.link(temporary, output / "report.json")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _unique_object(pairs):
@@ -292,9 +318,7 @@ def _preview(source, output, steps, *, preserve_tables, preserve_data_tables, ch
                 "modified": sorted(key for key in before["schema"].keys() & attempted["schema"].keys()
                                    if before["schema"][key] != attempted["schema"][key]),
             }
-        with (output / "report.json").open("x", encoding="utf-8") as stream:
-            json.dump(report, stream, ensure_ascii=True, indent=2, allow_nan=False)
-            stream.write("\n")
+        _publish_report(output, report)
         return report
     except (OSError, sqlite3.Error) as exc:
         raise MigrationError("Rehearsal setup or output failed; inspect the new output directory") from exc

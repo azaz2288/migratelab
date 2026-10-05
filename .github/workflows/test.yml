@@ -26,3 +26,4 @@ jobs:
           cd "$RUNNER_TEMP"
           migratelab --help
           python -c "import migratelab; assert 'site-packages' in migratelab.__file__"
+          python -I -m unittest discover -s "$GITHUB_WORKSPACE/tests" -p test_faults.py -v
