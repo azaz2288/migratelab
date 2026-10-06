@@ -199,7 +199,7 @@ def preview_chain(source: Path, output: Path, migrations, *, preserve_tables=(),
                     preserve_data_tables=preserve_data_tables, checks=checks, timeout=timeout)
 
 
-def _preview(source, output, steps, *, preserve_tables, preserve_data_tables, checks, timeout):
+def _preview(source, output, steps, *, preserve_tables, preserve_data_tables, checks, timeout, graph_review=None):
     """Backup a read-only source and migrate ONLY the new isolated copy.
 
     Existing outputs are never replaced. Failed migrations leave a rolled-back
@@ -260,6 +260,8 @@ def _preview(source, output, steps, *, preserve_tables, preserve_data_tables, ch
                 report['migration_chain'] = [{"from_version": step['from_version'], "to_version": step['to_version'],
                                              "sql_sha256": hashlib.sha256(step['sql'].encode()).hexdigest(),
                                              "executed": 0} for step in steps]
+            if graph_review is not None:
+                report['graph_review'] = graph_review
             copy.execute("BEGIN IMMEDIATE")
             attempted = before
             try:

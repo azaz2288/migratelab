@@ -1,2 +1,2 @@
 """Isolated SQLite migration rehearsals."""
-__version__ = "0.3.1"
+__version__ = "0.4.0"

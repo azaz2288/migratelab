@@ -17,6 +17,7 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: python examples/demo.py
       - run: python examples/version_chain.py
+      - run: python examples/graph_review.py
       - run: python -m compileall -q migratelab tests examples
       - run: python -m pip wheel --no-deps --wheel-dir dist .
       - name: Installed CLI
@@ -25,5 +26,8 @@ jobs:
           python -m pip install --no-deps dist/*.whl
           cd "$RUNNER_TEMP"
           migratelab --help
+          migratelab-review --help
           python -c "import migratelab; assert 'site-packages' in migratelab.__file__"
           python -I -m unittest discover -s "$GITHUB_WORKSPACE/tests" -p test_faults.py -v
+          python -I "$GITHUB_WORKSPACE/tests/test_graph.py" -v
+          python -I "$GITHUB_WORKSPACE/examples/graph_review.py"

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 from .core import MigrationError, load_checks, load_migrations, preview, preview_chain
+from .graph import preview_graph
 
 
 def main(argv=None):
@@ -17,8 +18,17 @@ def main(argv=None):
     parser.add_argument("--from-version", type=int, help="Expected source snapshot PRAGMA user_version")
     parser.add_argument("--to-version", type=int, help="Target user_version, changed only in the copy")
     parser.add_argument("--chain", action="store_true", help="Read migration as a JSON list of versioned SQL edges")
+    parser.add_argument('--graph', action='store_true', help='Read a declared edge catalog; requires an explicit --route')
+    parser.add_argument('--route', type=int, nargs='+', help='Complete version sequence for --graph, never inferred')
+    parser.add_argument('--expect-graph-sha256', help='With --graph, require the exact previously reviewed catalog digest')
     args = parser.parse_args(argv)
     try:
+        if args.graph and (args.chain or args.from_version is not None or args.to_version is not None):
+            raise MigrationError('--graph cannot combine with --chain or single-edge version flags')
+        if (args.graph and args.route is None) or (not args.graph and args.route is not None):
+            raise MigrationError('--graph requires an explicit --route; --route is only valid with --graph')
+        if args.expect_graph_sha256 is not None and not args.graph:
+            raise MigrationError('--expect-graph-sha256 is only valid with --graph')
         if args.chain and (args.from_version is not None or args.to_version is not None):
             raise MigrationError("--chain cannot be combined with single-edge version flags")
         if args.migration.stat().st_size > 256 * 1024:
@@ -28,7 +38,10 @@ def main(argv=None):
             checks = load_checks(args.checks)
         options = dict(preserve_tables=args.preserve_table, preserve_data_tables=args.preserve_data_table,
                        checks=checks, timeout=args.timeout)
-        if args.chain:
+        if args.graph:
+            report = preview_graph(args.source, args.output, load_migrations(args.migration), route=args.route,
+                                   expected_graph_sha256=args.expect_graph_sha256, **options)
+        elif args.chain:
             report = preview_chain(args.source, args.output, load_migrations(args.migration), **options)
         else:
             report = preview(args.source, args.output, args.migration.read_text(encoding="utf-8-sig"),

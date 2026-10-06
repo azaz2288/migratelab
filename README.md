@@ -69,7 +69,7 @@ Python API为 `preview_chain(source, output, migrations, ...)`，支持原有保
 
 ## 后续验收路线
 
-1. 在已实现显式版本链基础上增加迁移图审阅和受控版本历史，不能自动猜正式迁移路径。
+1. 已实现显式迁移图审阅；后续增加受控持久版本历史，不能自动猜正式迁移路径。
 2. 在现有typed数据摘要和只读scalar checks基础上扩展声明式关系不变量与版本兼容管理。
 3. 已覆盖基础锁竞争、空间不足、备份/报告中断；继续进程强杀、OS限额与大型WAL故障验收。
 4. 大型WAL数据库性能和硬资源隔离选项。
@@ -90,3 +90,37 @@ python -m unittest discover -s tests -p test_faults.py -v
 ```
 
 当前timeout是SQLite回调的协作预算，锁获取与OS I/O可能超出；这些注入不等同断电、文件系统崩溃、真实磁盘满或进程强杀验证。后续仍需要OS硬资源隔离与恢复流程。
+
+## v0.4 迁移图审阅与明确选择
+
+同一JSON格式现在也可声明分支、断开的版本分量和跳级边，不必组成一条连续链。先审阅目录，无需提供或打开数据库：
+
+```sh
+python -m migratelab.review catalog.json
+migratelab-review catalog.json --route 2 3 5
+python examples/graph_review.py
+```
+
+审阅只输出规范图摘要、版本、起点/终点、分支、每条边的SQL摘要与语句数量，以及可选的明确路径；不输出SQL正文、不执行SQL、不读取schema。`complete:true`仅表示声明/版本/SQL拆分检查完成，**不是SQL语义正确、schema兼容或安全批准**。未选边也要通过同样的输入检查。错误退出2，仅输出不含输入正文的失败消息，不给出部分审阅结果。
+
+```json
+[
+  {"from_version":2,"to_version":3,"sql":"ALTER TABLE players ADD COLUMN level INTEGER DEFAULT 1;"},
+  {"from_version":3,"to_version":5,"sql":"UPDATE players SET level=2;"},
+  {"from_version":2,"to_version":5,"sql":"DROP TABLE players;"}
+]
+```
+
+明确选择2→3→5，不会执行未选的2→5；即使只有一条可能路径也不自动选择：
+
+```sh
+migratelab source.sqlite catalog.json new-preview --graph --route 2 3 5 --preserve-table players
+```
+
+可加 `--expect-graph-sha256` 并传入审阅输出的64位小写 `graph_sha256`，防止审阅后目录改变。不同摘要在数据库访问和输出创建前拒绝，连未选边的SQL变化也会拒绝。摘要覆盖按from/to排序的完整边目录（字段from_version/to_version/sql），用 `json.dumps(..., ensure_ascii=True, sort_keys=True, separators=(',', ':'))` 的UTF-8字节计算SHA256；输入边排序不影响它，SQL空白变化会影响它。它不是身份签名、来源认证或人工审批，不能还原SQL，请自行保留原目录。此绑定是可选项，默认不代表已有人审阅。
+
+图上限100条边/SQL合计256KiB，CLI JSON另限256KiB；版本范围和严格类型沿用链模式，重复版本对即使SQL相同也拒绝，不作覆盖。递增边天然无环，不枚举所有可能路径；可以显式选择某个分量的一段2至101个版本的路径，起点必须与backup副本版本一致。所有选择的边仍在一个事务中执行，最终不变量失败会整体回滚。既有SQL与 `--chain` 保持兼容；`--graph` 不可混用 `--chain` 或单边版本参数。
+
+Python接口：`from migratelab.graph import review_graph, preview_graph`；后者必须传 `route=[2,3,5]`，可选 `expected_graph_sha256=review['graph_sha256']`，其余保留表/typed数据/checks/timeout策略与链模式一致。预演报告schema版本1增加 `graph_review` 元数据，`migration_chain` 仅列选中的执行边；旧读取器应忽略额外字段。报告发布故障仍退出2，副本可能已commit，不能称为回滚。
+
+没有自动路由、持久历史账本、正式库执行、GUI或签名审批。审阅输出隐藏SQL正文不等于全部产物不敏感：原目录含SQL，预演报告schema/错误文本和副本仍可能含私密信息。哈希本身也不是匿名化保证；资源隔离与协作timeout局限不变。
